@@ -8,9 +8,16 @@ import (
     "bytes"
     "time"
     "strings"
+    "github.com/streadway/amqp"
+    "log"
     //"net/url"
 )
 
+type ServerMsg struct {
+    _context_request_id   string
+    Context_request_id   string
+    Priority              string
+}
 
 type PGConfig struct {
     ConfigName     string
@@ -20,6 +27,8 @@ type PGConfig struct {
     Bombard        bool
     NovaUrl        string
     Authinfo       AuthInfo
+    Rmquser        string
+    Rmqpass        string
 }
 
 type AuthInfo struct {
@@ -106,18 +115,64 @@ type Data struct {
     TestId        string    
     Responsetime  time.Duration
 }
+type Consumer struct {
+        conn    *amqp.Connection
+        channel *amqp.Channel
+        tag     string
+        done    chan error
+}
+
 
 var AsyncRespChannel = make(chan Data)
 var respTime = make(map[string]map[string]time.Duration)
 
 var dataChannel = make(chan Data)
+var rmqchannel = make(chan PGConfig)
+func (c *Consumer) Shutdown() error {
+        // will close() the deliveries channel
+        if err := c.channel.Cancel(c.tag, true); err != nil {
+                return fmt.Errorf("Consumer cancel failed: %s", err)
+        }
 
+        if err := c.conn.Close(); err != nil {
+                return fmt.Errorf("AMQP connection close error: %s", err)
+        }
+
+        defer log.Printf("AMQP shutdown OK")
+
+        // wait for handle() to exit
+        return <-c.done
+}
+func handle(deliveries <-chan amqp.Delivery, done chan error) {
+        fmt.Printf("Handling AMQP messages %v\n", deliveries)
+        for d := range deliveries {
+                fmt.Printf("rcvd...")
+                //log.Printf(
+                //        "got %dB delivery: [%v] %q",
+                //        len(d.Body),
+                //        d.DeliveryTag,
+                //        d.Body,
+                //)
+                var msg ServerMsg
+                json.Unmarshal(d.Body, &msg)
+                fmt.Printf("msg is %v\n",msg)
+                /* Ack the previous messages as well */
+                d.Ack(true)
+        }
+        log.Printf("handle: deliveries channel closed")
+        done <- nil
+}
 
 func loop() {
     /* We defined channel for each request go routines to synchronize
      * and send results.
      */ 
     fmt.Printf("loop\n")
+    c, err := NewConsumer("amqp://guest:ravi@localhost:5672", "nova", "fanout", "perf-tool", "notifications.info", "perf-tool")
+    if err != nil {
+        log.Fatalf("%s", err)
+    }
+
     for {
         select {
             case data := <- AsyncRespChannel:
@@ -132,10 +187,18 @@ func loop() {
                     respTime[data.TestId][data.RequestId] = data.Responsetime
                 }
                 fmt.Printf("respTime map is %v\n", respTime)
+           // case pgconfig := <- rmqchannel:
+                //init_consumer(pgconfig.Rmquser, pgconfig.Rmqpass)
         }
+    }
+    log.Printf("shutting down")
+
+    if err := c.Shutdown(); err != nil {
+        log.Fatalf("error during shutdown: %s", err)
     }
  
 }
+
 
 func main() {
     // Handle web services in a go routine
@@ -236,6 +299,7 @@ func config_handler(w http.ResponseWriter, r *http.Request) {
         if pgconfig.Authinfo != (AuthInfo{}) {
           go gettoken(pgconfig.Authinfo)
         }
+        //rmqchannel <- pgconfig
     }
 }
 
@@ -314,4 +378,102 @@ func test(serverStr string, w http.ResponseWriter, uuid string) {
         data.RequestId = reqid
         data.Responsetime = t1
         AsyncRespChannel <- data
-} 
+}
+
+func NewConsumer(amqpURI, exchange, exchangeType, queueName, key, ctag string) (*Consumer, error) {
+        c := &Consumer{
+                conn:    nil,
+                channel: nil,
+                tag:     ctag,
+                done:    make(chan error),
+        }
+
+        var err error
+
+        log.Printf("dialing %q", amqpURI)
+        c.conn, err = amqp.Dial(amqpURI)
+        if err != nil {
+                return nil, fmt.Errorf("Dial: %s", err)
+        }
+
+        go func() {
+                fmt.Printf("closing: %s", <-c.conn.NotifyClose(make(chan *amqp.Error)))
+        }()
+
+        log.Printf("got Connection, getting Channel")
+        c.channel, err = c.conn.Channel()
+        if err != nil {
+                return nil, fmt.Errorf("Channel: %s", err)
+        }
+
+        log.Printf("got Channel, declaring Exchange (%q)", exchange)
+/*
+        if err = c.channel.ExchangeDeclare(
+                exchange,     // name of the exchange
+                exchangeType, // type
+                true,         // durable
+                false,        // delete when complete
+                false,        // internal
+                false,        // noWait
+                nil,          // arguments
+        ); err != nil {
+                return nil, fmt.Errorf("Exchange Declare: %s", err)
+        }
+*/
+        log.Printf("declared Exchange, declaring Queue %q", queueName)
+        queue, err := c.channel.QueueDeclare(
+                queueName, // name of the queue
+                true,      // durable
+                false,     // delete when usused
+                false,     // exclusive
+                false,     // noWait
+                nil,       // arguments
+        )
+        if err != nil {
+                return nil, fmt.Errorf("Queue Declare: %s", err)
+        }
+        log.Printf("declared Queue (%q %d messages, %d consumers), binding to Exchange (key %q)",
+                queue.Name, queue.Messages, queue.Consumers, key)
+        if err = c.channel.QueueBind(
+                queueName, // name of the queue
+                key,        // bindingKey
+                exchange,   // sourceExchange
+                false,      // noWait
+                nil,        // arguments
+        ); err != nil {
+                return nil, fmt.Errorf("Queue Bind: %s", err)
+        }
+        log.Printf("Queue bound to Exchange, starting Consume (consumer tag %q)", c.tag)
+/*
+        if err = c.channel.ExchangeBind(
+                exchange,     // name of the exchange
+                key, // type
+                "neutron",         // durable
+                false,        // noWait
+                nil,          // arguments
+        ); err != nil {
+                return nil, fmt.Errorf("Exchange Bind: %s", err)
+        }
+*/
+        log.Printf("Exchange Binded to neutron, starting Consume (consumer tag %q)", c.tag)
+
+
+        deliveries, err := c.channel.Consume(
+                queueName, // name
+                c.tag,      // consumerTag,
+                false,      // noAck
+                false,      // exclusive
+                false,      // noLocal
+                false,      // noWait
+                nil,        // arguments
+        )
+        if err != nil {
+                return nil, fmt.Errorf("Queue Consume: %s", err)
+        }
+
+        go handle(deliveries, c.done)
+
+        return c, nil
+}
+
+
