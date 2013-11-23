@@ -14,9 +14,9 @@ import (
 )
 
 type ServerMsg struct {
-    _context_request_id   string
-    Context_request_id   string
+    RequestId             string `json:"_context_request_id"`
     Priority              string
+    Event_Type            string
 }
 
 type PGConfig struct {
@@ -112,9 +112,10 @@ var authInfo Auth
 var pgconfig PGConfig
 type Data struct {
     RequestId     string
-    TestId        string    
-    Responsetime  time.Duration
+    StartTime     time.Time
 }
+var StartTime_g  time.Time
+
 type Consumer struct {
         conn    *amqp.Connection
         channel *amqp.Channel
@@ -124,7 +125,8 @@ type Consumer struct {
 
 
 var AsyncRespChannel = make(chan Data)
-var respTime = make(map[string]map[string]time.Duration)
+var respTime = make(map[string]map[string]time.Time)
+var result string
 
 var dataChannel = make(chan Data)
 var rmqchannel = make(chan PGConfig)
@@ -155,6 +157,16 @@ func handle(deliveries <-chan amqp.Delivery, done chan error) {
                 //)
                 var msg ServerMsg
                 json.Unmarshal(d.Body, &msg)
+                t1 := time.Since(StartTime_g)
+                _, ok := respTime[msg.RequestId] 
+                if ok {
+                    if msg.Event_Type == "compute.instance.create.end" {
+                    
+                        xstr := (fmt.Sprintf(`{"%v":"%v"}`,
+                               msg.RequestId, t1))
+                        result += xstr
+                    }
+                }
                 fmt.Printf("msg is %v\n",msg)
                 /* Ack the previous messages as well */
                 d.Ack(true)
@@ -178,14 +190,7 @@ func loop() {
             case data := <- AsyncRespChannel:
                 // Collect the response time and store in a map 
                 fmt.Printf("Recevied from channel %v\n", data)
-                reqd, ok := respTime[data.TestId]
-                if !ok {
-                    reqd = make(map[string]time.Duration)
-                    reqd[data.RequestId] = data.Responsetime
-                    respTime[data.TestId] = reqd
-                } else {
-                    respTime[data.TestId][data.RequestId] = data.Responsetime
-                }
+                respTime[data.RequestId] = nil
                 fmt.Printf("respTime map is %v\n", respTime)
            // case pgconfig := <- rmqchannel:
                 //init_consumer(pgconfig.Rmquser, pgconfig.Rmqpass)
@@ -222,7 +227,7 @@ func generate_uuid() string {
 }
 
 func server_result_handler(w http.ResponseWriter, r *http.Request) {
-    fmt.Fprintf(w, "%v", respTime)
+    fmt.Fprintf(w, "%v", result)
 }
 
 func validate_content(contentType []string) bool {
@@ -335,6 +340,7 @@ func launchservers(server ServerInfo, w http.ResponseWriter, uuid string) {
 }
 
 func test(serverStr string, w http.ResponseWriter, uuid string) {
+        StartTime_g = time.Now()
         client := &http.Client{}
         buf := strings.NewReader(serverStr)
         req, err := http.NewRequest("POST", pgconfig.NovaUrl+"/"+ authInfo.Access.Token.Tenant.Id+ "/" + "servers", buf)
@@ -352,7 +358,6 @@ func test(serverStr string, w http.ResponseWriter, uuid string) {
         if err != nil {
             fmt.Printf("%v\n", err)
         }
-        t1 := time.Since(t0)
         reqid := resp.Header.Get("X-Compute-Request-Id")
   
         // parse the body and get the server id
@@ -372,12 +377,11 @@ func test(serverStr string, w http.ResponseWriter, uuid string) {
             href := link.Href
             fmt.Printf("href is %v\n", href)
         }
-        fmt.Printf("Response took %v and status is %v for server id %v\n", t1, resp.Status, reqid)
         var data Data
-        data.TestId = uuid
         data.RequestId = reqid
-        data.Responsetime = t1
+        //data.StartTime= t0
         AsyncRespChannel <- data
+        fmt.Printf("Request start time %v and status is %v for server id %v\n", t0, resp.Status, reqid)
 }
 
 func NewConsumer(amqpURI, exchange, exchangeType, queueName, key, ctag string) (*Consumer, error) {
