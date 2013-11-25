@@ -10,7 +10,7 @@ import (
     "strings"
     "github.com/streadway/amqp"
     "log"
-    //"net/url"
+    "container/list"
 )
 
 type ServerMsg struct {
@@ -113,8 +113,10 @@ var pgconfig PGConfig
 type Data struct {
     RequestId     string
     StartTime     time.Time
+    ResponseTime  time.Duration
 }
 var StartTime_g  time.Time
+var results = list.New()
 
 type Consumer struct {
         conn    *amqp.Connection
@@ -125,11 +127,12 @@ type Consumer struct {
 
 
 var AsyncRespChannel = make(chan Data)
-var respTime = make(map[string]map[string]time.Time)
 var result string
 
 var dataChannel = make(chan Data)
 var rmqchannel = make(chan PGConfig)
+
+
 func (c *Consumer) Shutdown() error {
         // will close() the deliveries channel
         if err := c.channel.Cancel(c.tag, true); err != nil {
@@ -149,22 +152,19 @@ func handle(deliveries <-chan amqp.Delivery, done chan error) {
         fmt.Printf("Handling AMQP messages %v\n", deliveries)
         for d := range deliveries {
                 fmt.Printf("rcvd...")
-                //log.Printf(
-                //        "got %dB delivery: [%v] %q",
-                //        len(d.Body),
-                //        d.DeliveryTag,
-                //        d.Body,
-                //)
                 var msg ServerMsg
                 json.Unmarshal(d.Body, &msg)
-                t1 := time.Since(StartTime_g)
-                _, ok := respTime[msg.RequestId] 
-                if ok {
+                var data *Data
+                for e := results.Front(); e != nil ; e = e.Next() {
+                    data = e.Value.(*Data)
+                    if data.RequestId == msg.RequestId {
+                        break
+                    }
+                }
+                if data != nil {
                     if msg.Event_Type == "compute.instance.create.end" {
-                    
-                        xstr := (fmt.Sprintf(`{"%v":"%v"}`,
-                               msg.RequestId, t1))
-                        result += xstr
+                        t1 := time.Since(data.StartTime)
+                        data.ResponseTime = t1
                     }
                 }
                 fmt.Printf("msg is %v\n",msg)
@@ -190,10 +190,7 @@ func loop() {
             case data := <- AsyncRespChannel:
                 // Collect the response time and store in a map 
                 fmt.Printf("Recevied from channel %v\n", data)
-                respTime[data.RequestId] = nil
-                fmt.Printf("respTime map is %v\n", respTime)
-           // case pgconfig := <- rmqchannel:
-                //init_consumer(pgconfig.Rmquser, pgconfig.Rmqpass)
+                results.PushBack(&data)
         }
     }
     log.Printf("shutting down")
@@ -228,6 +225,10 @@ func generate_uuid() string {
 
 func server_result_handler(w http.ResponseWriter, r *http.Request) {
     fmt.Fprintf(w, "%v", result)
+    for e := results.Front(); e != nil ; e = e.Next() {
+        data := e.Value.(*Data)
+        fmt.Printf("%v\n", data)
+    }
 }
 
 func validate_content(contentType []string) bool {
@@ -250,10 +251,20 @@ func server_handler(w http.ResponseWriter, r *http.Request) {
     fmt.Printf("Request is %v\n", r)
     switch r.Method {
         case "GET":
-            //Get the result of a test. Make sure server id is passed 
-            fmt.Printf("URL is %v\n", r.URL)
-            // For now send URL back to the caller 
-            fmt.Fprintf(w, "%v", r.URL)
+            response := (fmt.Sprintf(`[`))
+            var resstr string
+            for e := results.Front(); e != nil; e = e.Next() {
+                data := e.Value.(*Data)
+                if data != nil {
+                    resstr += (fmt.Sprintf(`{"request_id" : "%s", "start_time" :"%s", "response_duration": "%s"}`, data.RequestId, data.StartTime,
+                               data.ResponseTime))
+                }
+            }
+            response = (fmt.Sprintf(`[%s]`, resstr))
+            w.Header().Add("Content-Type", "application/json")
+            fmt.Fprintf(w, response)           
+                
+           
         case "POST":
             body, err := ioutil.ReadAll(r.Body)
             if err != nil {
@@ -334,6 +345,8 @@ func launchservers(server ServerInfo, w http.ResponseWriter, uuid string) {
     fmt.Printf("Launching servers\n")
     serverStr := (fmt.Sprintf(`{"server":{"flavorRef":"%s", "imageRef":"%s", "name":"%s"} }`,
                  server.FlavorRef, server.ImageRef,server.Name))
+    /* clean up results before starting a new test */
+    results.Init()
     for i:= 0; i< pgconfig.Connections; i++ {
         go test(serverStr, w, uuid)
     }
@@ -358,6 +371,7 @@ func test(serverStr string, w http.ResponseWriter, uuid string) {
         if err != nil {
             fmt.Printf("%v\n", err)
         }
+        t1 := time.Since(t0)
         reqid := resp.Header.Get("X-Compute-Request-Id")
   
         // parse the body and get the server id
@@ -379,7 +393,8 @@ func test(serverStr string, w http.ResponseWriter, uuid string) {
         }
         var data Data
         data.RequestId = reqid
-        //data.StartTime= t0
+        data.StartTime= t0
+        data.ResponseTime = t1
         AsyncRespChannel <- data
         fmt.Printf("Request start time %v and status is %v for server id %v\n", t0, resp.Status, reqid)
 }
